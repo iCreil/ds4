@@ -1011,6 +1011,136 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
+/* RAM-resident expert streaming: when the whole model file sits in the page
+ * cache (host RAM >= model size), the pread+staging round-trip in
+ * cuda_model_copy_to_device_streamed is pure overhead — the data is already
+ * in RAM. Opt-in via DS4_CUDA_HOST_REGISTER_EXPERTS=1: pin the routed-expert
+ * byte ranges of the model mapping with cudaHostRegister (pin-only, no
+ * device mapping) so expert-cache misses become a single async DMA straight
+ * from the mmap. Registration is lazy (first touch of each layer's expert
+ * table), chunked, and falls back to the staged path for anything that
+ * fails to register. Ranges are aligned INWARD to whole pages so that two
+ * adjacent tensors never try to register the same boundary page twice
+ * (overlapping cudaHostRegister calls fail). */
+struct cuda_expert_reg_span {
+    uintptr_t req_base;   /* requested (unaligned) range, for idempotence */
+    uint64_t  req_bytes;
+    uintptr_t reg_base;   /* actually registered (page-aligned) range */
+    uint64_t  reg_bytes;
+};
+static std::vector<cuda_expert_reg_span> g_expert_reg_spans;
+static int g_expert_reg_disabled;
+static uint64_t g_expert_reg_total_bytes;
+/* Registration/unregistration chunk: cudaHostUnregister must be called with
+ * the exact pointers handed to cudaHostRegister, so both sides step by this. */
+#define CUDA_EXPERT_REG_CHUNK_BYTES (1024ull * 1048576ull)
+
+static int cuda_expert_host_register_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_CUDA_HOST_REGISTER_EXPERTS") != NULL ? 1 : 0;
+    return cached;
+}
+
+static int cuda_expert_range_is_registered(const void *ptr, uint64_t bytes) {
+    if (bytes == 0) return 0;
+    const uintptr_t start = (uintptr_t)ptr;
+    for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
+        if (span.reg_bytes == 0) continue;
+        if (start >= span.reg_base &&
+            bytes <= span.reg_bytes - (uint64_t)(start - span.reg_base)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void cuda_expert_host_register_span(const void *base_ptr,
+                                           uint64_t bytes,
+                                           const char *what) {
+    if (g_expert_reg_disabled || !base_ptr || bytes == 0) return;
+    const uintptr_t req_base = (uintptr_t)base_ptr;
+    for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
+        if (span.req_base == req_base && span.req_bytes == bytes) return;
+    }
+
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    /* Inward alignment: never touch a page shared with a neighboring span. */
+    const uintptr_t reg_start = (uintptr_t)cuda_round_up((uint64_t)req_base, page_sz);
+    const uintptr_t reg_end = (uintptr_t)cuda_round_down((uint64_t)(req_base + bytes), page_sz);
+    cuda_expert_reg_span span = {req_base, bytes, 0, 0};
+    if (reg_end > reg_start) {
+        const uint64_t chunk = CUDA_EXPERT_REG_CHUNK_BYTES;
+        uintptr_t p = reg_start;
+        while (p < reg_end) {
+            uint64_t n = (uint64_t)(reg_end - p);
+            if (n > chunk) n = chunk;
+            cudaError_t err = cudaHostRegister((void *)p, (size_t)n,
+                                               cudaHostRegisterReadOnly);
+            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
+                /* Read-only pinning unsupported (or read-only mmap rejected):
+                 * retry plain once, then give up for good if that also fails. */
+                (void)cudaGetLastError();
+                err = cudaHostRegister((void *)p, (size_t)n,
+                                       cudaHostRegisterDefault);
+            }
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA expert host registration stopped for %s after %.2f MiB: %s\n",
+                        what ? what : "experts",
+                        (double)(p - reg_start) / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                if (p == reg_start &&
+                    (err == cudaErrorNotSupported || err == cudaErrorInvalidValue)) {
+                    g_expert_reg_disabled = 1;
+                }
+                break;
+            }
+            p += (uintptr_t)n;
+        }
+        if (p > reg_start) {
+            span.reg_base = reg_start;
+            span.reg_bytes = (uint64_t)(p - reg_start);
+            g_expert_reg_total_bytes += span.reg_bytes;
+        }
+    }
+    /* Record even zero-length results so the (base, bytes) pair is not
+     * re-attempted on every layer touch. */
+    g_expert_reg_spans.push_back(span);
+    if (span.reg_bytes != 0 && getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA registered %s %.2f MiB for direct H2D (total %.2f GiB)\n",
+                what ? what : "experts",
+                (double)span.reg_bytes / 1048576.0,
+                (double)g_expert_reg_total_bytes / 1073741824.0);
+    }
+}
+
+static void cuda_expert_host_register_table_ranges(const void *model_map,
+                                                   uint64_t model_size,
+                                                   uint32_t n_total_expert,
+                                                   uint64_t gate_offset,
+                                                   uint64_t up_offset,
+                                                   uint64_t down_offset,
+                                                   uint64_t gate_expert_bytes,
+                                                   uint64_t down_expert_bytes) {
+    if (!cuda_expert_host_register_enabled() || g_expert_reg_disabled) return;
+    if (!model_map || n_total_expert == 0) return;
+    const uint64_t full_gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t full_down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
+        full_gate_bytes > model_size - gate_offset ||
+        full_gate_bytes > model_size - up_offset ||
+        full_down_bytes > model_size - down_offset) {
+        return;
+    }
+    const char *base = (const char *)model_map;
+    cuda_expert_host_register_span(base + gate_offset, full_gate_bytes, "moe_gate experts");
+    cuda_expert_host_register_span(base + up_offset, full_gate_bytes, "moe_up experts");
+    cuda_expert_host_register_span(base + down_offset, full_down_bytes, "moe_down experts");
+}
+
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (g_model_stage_bytes >= bytes) return 1;
     for (size_t i = 0; i < 4; i++) {
@@ -2021,6 +2151,14 @@ static int cuda_stream_expert_cache_load_slot(
         uint64_t down_offset,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
+    cuda_expert_host_register_table_ranges(model_map,
+                                           model_size,
+                                           n_total_expert,
+                                           gate_offset,
+                                           up_offset,
+                                           down_offset,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
     const uint64_t gate_src =
         gate_offset + (uint64_t)expert * gate_expert_bytes;
     const uint64_t up_src =
@@ -2160,6 +2298,26 @@ static int cuda_model_copy_to_device_streamed(
         return 0;
     }
     if (bytes == 0) return 1;
+    if (cuda_expert_range_is_registered((const char *)model_map + offset, bytes)) {
+        /* Pinned mapping: single async DMA straight from the page cache. No
+         * pread, no staging copy, and the source pages are locked so the
+         * post-copy eviction hints below must not run for this range. */
+        cudaError_t err = cudaMemcpyAsync(dst,
+                                          (const char *)model_map + offset,
+                                          (size_t)bytes,
+                                          cudaMemcpyHostToDevice,
+                                          g_stream_selected_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming registered copy failed for %s: %s\n",
+                    what ? what : "expert",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        return cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                       what ? what : "stream registered expert copy");
+    }
     if (g_model_fd < 0 ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
@@ -2320,6 +2478,20 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_registered && g_model_host_base) {
         (void)cudaHostUnregister((void *)g_model_host_base);
     }
+    for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
+        /* Mirror the chunked registration: one unregister per register call. */
+        const uint64_t chunk = CUDA_EXPERT_REG_CHUNK_BYTES;
+        uint64_t done = 0;
+        while (done < span.reg_bytes) {
+            uint64_t n = span.reg_bytes - done;
+            if (n > chunk) n = chunk;
+            (void)cudaHostUnregister((void *)(span.reg_base + (uintptr_t)done));
+            done += n;
+        }
+    }
+    g_expert_reg_spans.clear();
+    g_expert_reg_total_bytes = 0;
+    g_expert_reg_disabled = 0;
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -2918,6 +3090,15 @@ static int cuda_stream_selected_cache_begin_compact_load(
         fprintf(stderr, "ds4: CUDA streaming selected expert range outside model map\n");
         return 0;
     }
+
+    cuda_expert_host_register_table_ranges(model_map,
+                                           model_size,
+                                           n_total_expert,
+                                           gate_offset,
+                                           up_offset,
+                                           down_offset,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
 
     if (!allow_global_cache) {
         cuda_stream_expert_cache_release_all();
