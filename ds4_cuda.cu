@@ -1139,6 +1139,13 @@ static void cuda_expert_host_register_table_ranges(const void *model_map,
     cuda_expert_host_register_span(base + gate_offset, full_gate_bytes, "moe_gate experts");
     cuda_expert_host_register_span(base + up_offset, full_gate_bytes, "moe_up experts");
     cuda_expert_host_register_span(base + down_offset, full_down_bytes, "moe_down experts");
+    static int notice_printed;
+    if (!notice_printed && g_expert_reg_total_bytes != 0) {
+        notice_printed = 1;
+        fprintf(stderr,
+                "ds4: CUDA expert host registration active (single-copy H2D; "
+                "ranges pinned lazily per layer)\n");
+    }
 }
 
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
