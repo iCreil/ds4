@@ -1113,6 +1113,50 @@ static void cuda_expert_host_register_span(const void *base_ptr,
     }
 }
 
+/* DS4_CUDA_SELECTED_LOAD_PROFILE=1: accumulate per-call timings of the
+ * selected/compact expert load and print a summary line every 430 calls
+ * (~10 decode tokens at 43 layers). Diagnostic only. */
+static int cuda_selected_load_profile_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_CUDA_SELECTED_LOAD_PROFILE") != NULL ? 1 : 0;
+    return cached;
+}
+struct cuda_selected_load_stats {
+    double total_s, copy_s, flush_s;
+    uint64_t calls, hits, misses, direct_bytes;
+};
+static cuda_selected_load_stats g_sel_stats;
+static double cuda_prof_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+static void cuda_selected_load_stats_note(double total_s, double copy_s, double flush_s,
+                                          uint32_t hits, uint32_t misses,
+                                          uint64_t direct_bytes) {
+    g_sel_stats.total_s += total_s;
+    g_sel_stats.copy_s += copy_s;
+    g_sel_stats.flush_s += flush_s;
+    g_sel_stats.hits += hits;
+    g_sel_stats.misses += misses;
+    g_sel_stats.direct_bytes += direct_bytes;
+    if (++g_sel_stats.calls % 430 == 0) {
+        fprintf(stderr,
+                "ds4: selected-load profile: calls=%llu total=%.2fms/call copies=%.2fms/call "
+                "flush=%.2fms/call hits=%llu misses=%llu bytes/call=%.1fMB eff=%.2fGB/s\n",
+                (unsigned long long)g_sel_stats.calls,
+                g_sel_stats.total_s / g_sel_stats.calls * 1000.0,
+                g_sel_stats.copy_s / g_sel_stats.calls * 1000.0,
+                g_sel_stats.flush_s / g_sel_stats.calls * 1000.0,
+                (unsigned long long)g_sel_stats.hits,
+                (unsigned long long)g_sel_stats.misses,
+                (double)g_sel_stats.direct_bytes / g_sel_stats.calls / 1e6,
+                g_sel_stats.total_s > 0 ?
+                    (double)g_sel_stats.direct_bytes / g_sel_stats.total_s / 1e9 : 0.0);
+        memset(&g_sel_stats, 0, sizeof(g_sel_stats));
+    }
+}
+
 /* End a batched-sync window: one synchronize covering every deferred copy.
  * Also safe to call on early-error paths (result ignored there). */
 static int cuda_expert_defer_flush(const char *what) {
@@ -3102,6 +3146,9 @@ static int cuda_stream_selected_cache_begin_compact_load(
         uint64_t       down_expert_bytes,
         int            strict_failure,
         int            allow_global_cache) {
+    const int prof = cuda_selected_load_profile_enabled();
+    const double prof_t0 = prof ? cuda_prof_now() : 0.0;
+    double prof_t1 = 0.0;
     cuda_stream_selected_cache_invalidate();
     cuda_model_load_progress_finish();
 
@@ -3295,6 +3342,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
+    if (prof) prof_t1 = cuda_prof_now();
     if (!cuda_expert_defer_flush("streaming selected batch flush")) {
         /* Copies may have failed mid-flight: cache slots marked valid this
          * batch cannot be trusted anymore. */
@@ -3310,6 +3358,17 @@ static int cuda_stream_selected_cache_begin_compact_load(
                  "streaming selected slot upload")) {
         cuda_stream_selected_cache_invalidate();
         return strict_failure ? 0 : 1;
+    }
+
+    if (prof) {
+        const double prof_t2 = cuda_prof_now();
+        cuda_selected_load_stats_note(prof_t2 - prof_t0,
+                                      prof_t1 - prof_t0,
+                                      prof_t2 - prof_t1,
+                                      cache_hits,
+                                      cache_misses + direct_loads,
+                                      (uint64_t)(cache_misses + direct_loads) *
+                                          (2u * gate_expert_bytes + down_expert_bytes));
     }
 
     g_stream_selected_cache.model_map = model_map;
