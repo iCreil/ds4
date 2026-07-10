@@ -1031,9 +1031,6 @@ struct cuda_expert_reg_span {
 static std::vector<cuda_expert_reg_span> g_expert_reg_spans;
 static int g_expert_reg_disabled;
 static uint64_t g_expert_reg_total_bytes;
-/* Registration/unregistration chunk: cudaHostUnregister must be called with
- * the exact pointers handed to cudaHostRegister, so both sides step by this. */
-#define CUDA_EXPERT_REG_CHUNK_BYTES (1024ull * 1048576ull)
 
 static int cuda_expert_host_register_enabled(void) {
     static int cached = -1;
@@ -1070,39 +1067,33 @@ static void cuda_expert_host_register_span(const void *base_ptr,
     const uintptr_t reg_end = (uintptr_t)cuda_round_down((uint64_t)(req_base + bytes), page_sz);
     cuda_expert_reg_span span = {req_base, bytes, 0, 0};
     if (reg_end > reg_start) {
-        const uint64_t chunk = CUDA_EXPERT_REG_CHUNK_BYTES;
-        uintptr_t p = reg_start;
-        while (p < reg_end) {
-            uint64_t n = (uint64_t)(reg_end - p);
-            if (n > chunk) n = chunk;
-            cudaError_t err = cudaHostRegister((void *)p, (size_t)n,
-                                               cudaHostRegisterReadOnly);
-            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
-                /* Read-only pinning unsupported (or read-only mmap rejected):
-                 * retry plain once, then give up for good if that also fails. */
-                (void)cudaGetLastError();
-                err = cudaHostRegister((void *)p, (size_t)n,
-                                       cudaHostRegisterDefault);
-            }
-            if (err != cudaSuccess) {
-                fprintf(stderr,
-                        "ds4: CUDA expert host registration stopped for %s after %.2f MiB: %s\n",
-                        what ? what : "experts",
-                        (double)(p - reg_start) / 1048576.0,
-                        cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                if (p == reg_start &&
-                    (err == cudaErrorNotSupported || err == cudaErrorInvalidValue)) {
-                    g_expert_reg_disabled = 1;
-                }
-                break;
-            }
-            p += (uintptr_t)n;
+        /* One cudaHostRegister per span: an async copy whose source straddles
+         * two separate registrations fails with cudaErrorInvalidValue, so a
+         * span must be pinned as a single unit (~1-2 GiB per expert tensor). */
+        const uint64_t n = (uint64_t)(reg_end - reg_start);
+        cudaError_t err = cudaHostRegister((void *)reg_start, (size_t)n,
+                                           cudaHostRegisterReadOnly);
+        if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
+            /* Read-only pinning unsupported (or read-only mmap rejected):
+             * retry plain once. */
+            (void)cudaGetLastError();
+            err = cudaHostRegister((void *)reg_start, (size_t)n,
+                                   cudaHostRegisterDefault);
         }
-        if (p > reg_start) {
+        if (err == cudaSuccess) {
             span.reg_base = reg_start;
-            span.reg_bytes = (uint64_t)(p - reg_start);
-            g_expert_reg_total_bytes += span.reg_bytes;
+            span.reg_bytes = n;
+            g_expert_reg_total_bytes += n;
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA expert host registration failed for %s (%.2f MiB): %s\n",
+                    what ? what : "experts",
+                    (double)n / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) {
+                g_expert_reg_disabled = 1;
+            }
         }
     }
     /* Record even zero-length results so the (base, bytes) pair is not
@@ -2486,14 +2477,8 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaHostUnregister((void *)g_model_host_base);
     }
     for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
-        /* Mirror the chunked registration: one unregister per register call. */
-        const uint64_t chunk = CUDA_EXPERT_REG_CHUNK_BYTES;
-        uint64_t done = 0;
-        while (done < span.reg_bytes) {
-            uint64_t n = span.reg_bytes - done;
-            if (n > chunk) n = chunk;
-            (void)cudaHostUnregister((void *)(span.reg_base + (uintptr_t)done));
-            done += n;
+        if (span.reg_bytes != 0) {
+            (void)cudaHostUnregister((void *)span.reg_base);
         }
     }
     g_expert_reg_spans.clear();
