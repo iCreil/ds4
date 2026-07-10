@@ -1043,10 +1043,10 @@ static int cuda_expert_range_is_registered(const void *ptr, uint64_t bytes) {
     const uintptr_t start = (uintptr_t)ptr;
     for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
         if (span.reg_bytes == 0) continue;
-        if (start >= span.reg_base &&
-            bytes <= span.reg_bytes - (uint64_t)(start - span.reg_base)) {
-            return 1;
-        }
+        if (start < span.reg_base) continue;
+        const uint64_t into = (uint64_t)(start - span.reg_base);
+        if (into >= span.reg_bytes) continue; /* start beyond span end */
+        if (bytes <= span.reg_bytes - into) return 1;
     }
     return 0;
 }
