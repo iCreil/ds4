@@ -1031,6 +1031,11 @@ struct cuda_expert_reg_span {
 static std::vector<cuda_expert_reg_span> g_expert_reg_spans;
 static int g_expert_reg_disabled;
 static uint64_t g_expert_reg_total_bytes;
+/* Batched-sync window: while a selected/compact load is in flight, registered
+ * copies and cache->compact D2D copies queue on the upload stream without a
+ * per-copy synchronize; the load flushes the stream once at the end. */
+static int g_expert_defer_sync;
+static int g_expert_async_pending;
 
 static int cuda_expert_host_register_enabled(void) {
     static int cached = -1;
@@ -1106,6 +1111,16 @@ static void cuda_expert_host_register_span(const void *base_ptr,
                 (double)span.reg_bytes / 1048576.0,
                 (double)g_expert_reg_total_bytes / 1073741824.0);
     }
+}
+
+/* End a batched-sync window: one synchronize covering every deferred copy.
+ * Also safe to call on early-error paths (result ignored there). */
+static int cuda_expert_defer_flush(const char *what) {
+    g_expert_defer_sync = 0;
+    if (!g_expert_async_pending) return 1;
+    g_expert_async_pending = 0;
+    return cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                   what ? what : "streaming selected batch flush");
 }
 
 static void cuda_expert_host_register_table_ranges(const void *model_map,
@@ -2119,21 +2134,31 @@ static int cuda_stream_expert_cache_copy_to_compact(
     const uint64_t down_src = (uint64_t)cache_slot * cache->down_expert_bytes;
     const uint64_t gate_dst = (uint64_t)compact_slot * cache->gate_expert_bytes;
     const uint64_t down_dst = (uint64_t)compact_slot * cache->down_expert_bytes;
-    return cuda_ok(cudaMemcpy(compact_gate + gate_dst,
-                              cache->gate_ptr + gate_src,
-                              (size_t)cache->gate_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
-                   "streaming selected gate cache copy") &&
-           cuda_ok(cudaMemcpy(compact_up + gate_dst,
-                              cache->up_ptr + gate_src,
-                              (size_t)cache->gate_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
-                   "streaming selected up cache copy") &&
-           cuda_ok(cudaMemcpy(compact_down + down_dst,
-                              cache->down_ptr + down_src,
-                              (size_t)cache->down_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
-                   "streaming selected down cache copy");
+    /* Rides the upload stream: FIFO order keeps it after the H2D that filled
+     * the cache slot (same stream), and the batch flush in the compact load
+     * (the only caller) publishes it before compute. */
+    if (!cuda_ok(cudaMemcpyAsync(compact_gate + gate_dst,
+                                 cache->gate_ptr + gate_src,
+                                 (size_t)cache->gate_expert_bytes,
+                                 cudaMemcpyDeviceToDevice,
+                                 g_stream_selected_upload_stream),
+                 "streaming selected gate cache copy") ||
+        !cuda_ok(cudaMemcpyAsync(compact_up + gate_dst,
+                                 cache->up_ptr + gate_src,
+                                 (size_t)cache->gate_expert_bytes,
+                                 cudaMemcpyDeviceToDevice,
+                                 g_stream_selected_upload_stream),
+                 "streaming selected up cache copy") ||
+        !cuda_ok(cudaMemcpyAsync(compact_down + down_dst,
+                                 cache->down_ptr + down_src,
+                                 (size_t)cache->down_expert_bytes,
+                                 cudaMemcpyDeviceToDevice,
+                                 g_stream_selected_upload_stream),
+                 "streaming selected down cache copy")) {
+        return 0;
+    }
+    g_expert_async_pending = 1;
+    return 1;
 }
 
 static int cuda_stream_expert_cache_load_slot(
@@ -2331,6 +2356,11 @@ static int cuda_model_copy_to_device_streamed(
             (void)cudaGetLastError();
             return 0;
         }
+        if (g_expert_defer_sync) {
+            /* Inside a batched load: the caller flushes the stream once. */
+            g_expert_async_pending = 1;
+            return 1;
+        }
         return cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
                        what ? what : "stream registered expert copy");
     }
@@ -2502,6 +2532,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_expert_reg_spans.clear();
     g_expert_reg_total_bytes = 0;
     g_expert_reg_disabled = 0;
+    g_expert_defer_sync = 0;
+    g_expert_async_pending = 0;
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
@@ -3154,6 +3186,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
     uint32_t cache_misses = 0;
     uint32_t direct_loads = 0;
 
+    g_expert_defer_sync = 1;
+    g_expert_async_pending = 0;
     for (uint32_t i = 0; i < compact_count; i++) {
         if (compact_ids[i] < 0 || (uint32_t)compact_ids[i] >= n_total_expert) {
             fprintf(stderr,
@@ -3161,6 +3195,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
                     compact_ids[i],
                     n_total_expert,
                     layer);
+            (void)cuda_expert_defer_flush(NULL);
             return 0;
         }
 
@@ -3253,10 +3288,19 @@ static int cuda_stream_selected_cache_begin_compact_load(
                                                     down_src,
                                                     down_expert_bytes,
                                                     "selected moe_down")) {
+                (void)cuda_expert_defer_flush(NULL);
                 cuda_stream_selected_cache_invalidate();
                 return strict_failure ? 0 : 1;
             }
         }
+    }
+
+    if (!cuda_expert_defer_flush("streaming selected batch flush")) {
+        /* Copies may have failed mid-flight: cache slots marked valid this
+         * batch cannot be trusted anymore. */
+        cuda_stream_selected_cache_invalidate();
+        cuda_stream_expert_cache_release_all();
+        return strict_failure ? 0 : 1;
     }
 
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
