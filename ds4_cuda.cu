@@ -2307,9 +2307,27 @@ static int cuda_model_copy_to_device_streamed(
                                           g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
-                    "ds4: CUDA streaming registered copy failed for %s: %s\n",
+                    "ds4: CUDA streaming registered copy failed for %s: %s "
+                    "(dst=%p src=%p bytes=%llu offset=%llu stream=%p)\n",
                     what ? what : "expert",
-                    cudaGetErrorString(err));
+                    cudaGetErrorString(err),
+                    (void *)dst,
+                    (const void *)((const char *)model_map + offset),
+                    (unsigned long long)bytes,
+                    (unsigned long long)offset,
+                    (void *)g_stream_selected_upload_stream);
+            for (const cuda_expert_reg_span &span : g_expert_reg_spans) {
+                const uintptr_t s = (uintptr_t)((const char *)model_map + offset);
+                if (span.reg_bytes != 0 && s >= span.reg_base &&
+                    s < span.reg_base + (uintptr_t)span.reg_bytes) {
+                    fprintf(stderr,
+                            "ds4:   containing span reg_base=%p reg_bytes=%llu "
+                            "(copy end inside=%d)\n",
+                            (void *)span.reg_base,
+                            (unsigned long long)span.reg_bytes,
+                            bytes <= span.reg_bytes - (uint64_t)(s - span.reg_base) ? 1 : 0);
+                }
+            }
             (void)cudaGetLastError();
             return 0;
         }
