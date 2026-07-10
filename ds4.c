@@ -1947,7 +1947,22 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
-    int fd = open(path, O_RDONLY);
+    /* DS4_MODEL_MMAP_PINNABLE: map the model writable+shared so that
+     * cudaHostRegister can pin its pages for direct H2D copies. Linux
+     * forbids long-term pinning of regular-file pages (ext4 & co.), so this
+     * only helps when the GGUF lives on tmpfs/shm — the intended use is a
+     * RAM-resident copy of the model. The writable mapping means a stray
+     * store could corrupt that RAM copy (never the original on disk if you
+     * keep it elsewhere); off by default. */
+    const bool pinnable_mapping = getenv("DS4_MODEL_MMAP_PINNABLE") != NULL;
+    int fd = pinnable_mapping ? open(path, O_RDWR) : open(path, O_RDONLY);
+    if (fd == -1 && pinnable_mapping) {
+        fprintf(stderr,
+                "ds4: DS4_MODEL_MMAP_PINNABLE: cannot open %s read-write (%s), "
+                "falling back to the read-only mapping\n",
+                path, strerror(errno));
+        fd = open(path, O_RDONLY);
+    }
     if (fd == -1) ds4_die_errno("cannot open model", path);
 
     struct stat st;
@@ -1966,9 +1981,16 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * normal user-space failure. Keeping CPU inference off the shared mapping
      * avoids that VM accounting path while preserving normal file-backed reads.
      */
-    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+    const bool pinnable = pinnable_mapping &&
+                          (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDWR;
+    const int mmap_prot = pinnable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    const int mmap_flags = (metal_mapping || pinnable) ? MAP_SHARED : MAP_PRIVATE;
+    void *map = mmap(NULL, (size_t)st.st_size, mmap_prot, mmap_flags, fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
+    if (pinnable) {
+        fprintf(stderr, "ds4: model mapped writable+shared for host pinning (%s)\n",
+                path);
+    }
 
     m->fd = fd;
     m->map = map;
