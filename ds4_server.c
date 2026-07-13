@@ -12235,19 +12235,18 @@ int main(int argc, char **argv) {
 
     const int n_slots = cfg.parallel > 0 ? cfg.parallel : 1;
     if (n_slots > 1 && cfg.engine.ssd_streaming) {
-        /* Interleaved multi-session is sound with streamed experts: the
-         * single graph worker serializes whole forward passes, so the
-         * selected-expert compact buffer is written and consumed within one
-         * layer of one pass and is never shared across sessions mid-flight.
-         * The expert cache is keyed by model+layer+expert (no session
-         * identity), so concurrent sessions share hits instead of fighting.
-         * Batched decode stays off on this path: ds4_engine_supports_
-         * batched_decode() refuses streaming engines, so slots fall back to
-         * interleaved single decode. */
+        /* Multi-session is sound with streamed experts: the single graph
+         * worker serializes whole forward passes, so the selected-expert
+         * compact buffer is written and consumed within one layer of one
+         * pass and is never shared across sessions mid-flight.  The expert
+         * cache is keyed by model+layer+expert (no session identity), so
+         * concurrent sessions share hits instead of fighting.  Batched
+         * decode, when enabled and supported (CUDA), loads the UNION of the
+         * batch's selected experts once per layer through the compact
+         * buffer — see metal_graph_encode_layer_ffn_decode_multi. */
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --parallel %d with --ssd-streaming: sessions "
-                   "interleave on the single-decode path (batched decode "
-                   "unavailable with streamed experts)",
+                   "share the streamed expert cache",
                    n_slots);
     }
 

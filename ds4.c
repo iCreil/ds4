@@ -19996,8 +19996,58 @@ static bool metal_graph_encode_layer_ffn_decode_multi(
                                                   g->scr->batch_shared_mid, n_seqs);
     }
 
-    /* Routed experts, one sequence at a time through the decode kernel. */
-    for (uint32_t b = 0; ok && b < n_seqs; b++) {
+    /* Routed experts.  Streaming: ONE batched pass through the compact
+     * buffer — load the union of the selected experts of every sequence
+     * (dedup + shared per-class cache, same machinery as the batch prefill)
+     * and let routed_moe consume the compact slots for all rows at once.
+     * One selected load per layer instead of one per sequence is where the
+     * batched decode gains over interleaving on streamed experts. */
+    if (ok && g->ssd_streaming) {
+        if (!metal_graph_decode_cuda_selected_slots_expected(g, layer)) {
+            fprintf(stderr,
+                    "ds4: batched decode with streamed experts: unsupported "
+                    "expert layout at layer %u\n", il);
+            ok = false;
+        }
+        if (ok) {
+            ok = metal_graph_cuda_stream_prefill_batch_selected_load(
+                    g, model, layer, il, n_seqs,
+                    gate_expert_bytes, down_expert_bytes);
+        }
+        if (ok) {
+            ok = ds4_gpu_routed_moe_batch_tensor(g->scr->batch_routed_out,
+                                                   g->scr->batch_routed_gate,
+                                                   g->scr->batch_routed_up,
+                                                   g->scr->batch_routed_mid,
+                                                   g->scr->batch_routed_down,
+                                                   model->map,
+                                                   model->size,
+                                                   layer->ffn_gate_exps->abs_offset,
+                                                   layer->ffn_up_exps->abs_offset,
+                                                   layer->ffn_down_exps->abs_offset,
+                                                   layer->ffn_gate_exps->type,
+                                                   layer->ffn_down_exps->type,
+                                                   gate_expert_bytes,
+                                                   gate_row_bytes,
+                                                   down_expert_bytes,
+                                                   down_row_bytes,
+                                                   (uint32_t)expert_in_dim,
+                                                   (uint32_t)down_in_dim,
+                                                   (uint32_t)routed_out_dim,
+                                                   g->scr->batch_router_selected,
+                                                   g->scr->batch_router_weights,
+                                                   DS4_N_EXPERT,
+                                                   DS4_N_EXPERT_USED,
+                                                   DS4_SWIGLU_CLAMP_EXP,
+                                                   g->scr->batch_ffn_norm,
+                                                   il,
+                                                   n_seqs,
+                                                   &g->scr->batch_routed_mid_is_f16) != 0;
+        }
+    }
+
+    /* Resident weights: one sequence at a time through the decode kernel. */
+    for (uint32_t b = 0; ok && !g->ssd_streaming && b < n_seqs; b++) {
         ds4_gpu_tensor *routed_out_row = metal_graph_tensor_row_view(
                 g->scr->batch_routed_out, b, DS4_N_EMBD);
         ds4_gpu_tensor *ffn_norm_row = metal_graph_tensor_row_view(
@@ -20076,7 +20126,12 @@ static bool metal_graph_encode_decode_multi(
     if (n_seqs == 0 || n_seqs > DS4_GPU_DECODE_MULTI_MAX) return false;
     if (metal_graph_directional_steering_attn_enabled(g)) return false;
     for (uint32_t b = 0; b < n_seqs; b++) {
-        if (graphs[b]->raw_cap == 0 || graphs[b]->ssd_streaming) return false;
+        if (graphs[b]->raw_cap == 0) return false;
+        /* Streaming: the routed experts go through the selected-batch compact
+         * load in the FFN stage (>= 2 sequences: the n==1 shape belongs to the
+         * single-token loader path); the non-routed weights come from the
+         * static decode map installed by the eval wrapper. */
+        if (graphs[b]->ssd_streaming && n_seqs < 2) return false;
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -22073,6 +22128,26 @@ static bool metal_graph_eval_decode_multi(
         const int              *tokens,
         const uint32_t         *pos,
         float *const           *logits) {
+    /* Streaming: install the static decode map (attention/shared/output
+     * spans) BEFORE opening the command buffer, mirroring the single-token
+     * streaming eval.  The map is engine-wide: flag every graph so the next
+     * batched or single eval skips the re-install. */
+    if (n_seqs > 0 && graphs[0]->ssd_streaming) {
+        const bool state_cache =
+            metal_graph_stream_decode_static_map_state_cache_enabled();
+        bool mapped = state_cache;
+        for (uint32_t b = 0; mapped && b < n_seqs; b++) {
+            mapped = graphs[b]->streaming_static_decode_map_current;
+        }
+        if (!mapped) {
+            if (!metal_graph_stream_map_decode_static_all(model, weights)) {
+                return false;
+            }
+            for (uint32_t b = 0; b < n_seqs; b++) {
+                graphs[b]->streaming_static_decode_map_current = state_cache;
+            }
+        }
+    }
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_decode_multi(graphs, n_seqs, model, weights,
                                                  tokens, pos, true);
@@ -28069,9 +28144,16 @@ int ds4_engine_supports_batched_decode(const ds4_engine *e) {
     (void)e;
     return 0;
 #else
+    /* Streaming engines batch on CUDA only: the multi FFN stage loads the
+     * union of the selected experts through the compact buffer (the same
+     * machinery the batch prefill uses), which is implemented by the CUDA
+     * backend.  It also relies on the static decode map covering the
+     * non-routed weights, so honor its disable env. */
     return e != NULL &&
            e->backend != DS4_BACKEND_CPU &&
-           !e->ssd_streaming &&
+           (!e->ssd_streaming ||
+            (e->backend == DS4_BACKEND_CUDA &&
+             getenv("DS4_METAL_DISABLE_STREAMING_STATIC_DECODE_MAP") == NULL)) &&
            e->directional_steering_dirs == NULL;
 #endif
 }
