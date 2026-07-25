@@ -23736,11 +23736,34 @@ __global__ static void stream_expert_gather_kernel(
     }
 }
 
+/* DS4_CUDA_STREAM_TIMING=1: accumulate host-side phase timings across
+ * begin_load calls and print averages every 61 calls (one token at 61
+ * layers). Diagnostic only. */
+static int g_stream_timing_enabled = -1;
+static uint64_t g_stream_timing_calls;
+static double g_stream_timing_find_us;
+static double g_stream_timing_copy_us;
+static double g_stream_timing_slots_us;
+static double g_stream_timing_total_us;
+
+static double cuda_stream_timing_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec * 1e-3;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t slot_count,
         int allow_cache_evict) {
+    if (g_stream_timing_enabled < 0) {
+        g_stream_timing_enabled = getenv("DS4_CUDA_STREAM_TIMING") != NULL;
+    }
+    const double t_begin =
+        g_stream_timing_enabled ? cuda_stream_timing_now_us() : 0.0;
+    double t_find_acc = 0.0;
+    double t_copy_acc = 0.0;
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
     if (!cuda_stream_selected_ranges_valid(table) || !selected_ids ||
@@ -23875,6 +23898,8 @@ static int cuda_stream_selected_cache_begin_load(
         int copied_from_global_cache = 0;
 
         if (!expert_cache_disabled) {
+            const double t_f0 = g_stream_timing_enabled ?
+                cuda_stream_timing_now_us() : 0.0;
             int cache_slot =
                 cuda_stream_expert_cache_find(expert_cache,
                                               table->model_map,
@@ -23887,6 +23912,9 @@ static int cuda_stream_selected_cache_begin_load(
                                               table->down_offset,
                                               table->gate_expert_bytes,
                                               table->down_expert_bytes);
+            if (g_stream_timing_enabled) {
+                t_find_acc += cuda_stream_timing_now_us() - t_f0;
+            }
             if (cache_slot >= 0) {
                 cache_hits++;
                 expert_cache->slots[(uint32_t)cache_slot].age =
@@ -23953,6 +23981,8 @@ static int cuda_stream_selected_cache_begin_load(
         }
 
         if (!copied_from_global_cache) {
+            const double t_c0 = g_stream_timing_enabled ?
+                cuda_stream_timing_now_us() : 0.0;
             const uint64_t gate_src =
                 table->gate_offset + expert * table->gate_expert_bytes;
             const uint64_t up_src =
@@ -23978,9 +24008,14 @@ static int cuda_stream_selected_cache_begin_load(
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
+            if (g_stream_timing_enabled) {
+                t_copy_acc += cuda_stream_timing_now_us() - t_c0;
+            }
         }
     }
 
+    const double t_g0 = g_stream_timing_enabled ?
+        cuda_stream_timing_now_us() : 0.0;
     if (any_gather && expert_cache) {
         const uint64_t slots_bytes =
             (uint64_t)gather_slots.size() * sizeof(int32_t);
@@ -24019,6 +24054,9 @@ static int cuda_stream_selected_cache_begin_load(
             return 0;
         }
     }
+    if (g_stream_timing_enabled) {
+        t_copy_acc += cuda_stream_timing_now_us() - t_g0;
+    }
 
     if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
         cuda_model_load_progress_finish();
@@ -24035,6 +24073,8 @@ static int cuda_stream_selected_cache_begin_load(
                 cache_misses,
                 direct_loads);
     }
+    const double t_s0 = g_stream_timing_enabled ?
+        cuda_stream_timing_now_us() : 0.0;
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids.data(),
                             (size_t)slot_count * sizeof(int32_t),
@@ -24042,6 +24082,9 @@ static int cuda_stream_selected_cache_begin_load(
                  "stream selected-id remap copy")) {
         cuda_stream_selected_cache_invalidate();
         return 0;
+    }
+    if (g_stream_timing_enabled) {
+        g_stream_timing_slots_us += cuda_stream_timing_now_us() - t_s0;
     }
 
     g_stream_selected_cache.logical_tier = logical_tier;
@@ -24062,6 +24105,25 @@ static int cuda_stream_selected_cache_begin_load(
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
     g_stream_selected_cache.valid = 1;
+    if (g_stream_timing_enabled) {
+        g_stream_timing_calls++;
+        g_stream_timing_find_us += t_find_acc;
+        g_stream_timing_copy_us += t_copy_acc;
+        g_stream_timing_total_us += cuda_stream_timing_now_us() - t_begin;
+        if (g_stream_timing_calls % 61u == 0u) {
+            fprintf(stderr,
+                    "ds4: stream timing avg over %llu loads: total %.1fus "
+                    "find %.1fus copy %.1fus slots %.1fus (per-token x61: "
+                    "total %.2fms)\n",
+                    (unsigned long long)g_stream_timing_calls,
+                    g_stream_timing_total_us / (double)g_stream_timing_calls,
+                    g_stream_timing_find_us / (double)g_stream_timing_calls,
+                    g_stream_timing_copy_us / (double)g_stream_timing_calls,
+                    g_stream_timing_slots_us / (double)g_stream_timing_calls,
+                    g_stream_timing_total_us / (double)g_stream_timing_calls *
+                        61.0 / 1000.0);
+        }
+    }
     return 1;
 }
 
