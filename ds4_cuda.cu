@@ -23757,6 +23757,9 @@ static double g_stream_timing_find_us;
 static double g_stream_timing_copy_us;
 static double g_stream_timing_slots_us;
 static double g_stream_timing_total_us;
+static double g_stream_timing_dedup_us;
+static double g_stream_timing_ensure_us;
+static double g_stream_timing_prepare_us;
 
 static double cuda_stream_timing_now_us(void) {
     struct timespec ts;
@@ -23788,6 +23791,8 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
+    const double t_d0 = g_stream_timing_enabled ?
+        cuda_stream_timing_now_us() : 0.0;
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
     std::vector<int32_t> slot_ids;
@@ -23831,6 +23836,11 @@ static int cuda_stream_selected_cache_begin_load(
          g_stream_selected_cache.slot_selected_ptr)) {
         cuda_stream_selected_cache_release();
     }
+    if (g_stream_timing_enabled) {
+        g_stream_timing_dedup_us += cuda_stream_timing_now_us() - t_d0;
+    }
+    const double t_e0 = g_stream_timing_enabled ?
+        cuda_stream_timing_now_us() : 0.0;
     if (ds4_gpu_set_current_device(logical_tier) != 0) {
         cuda_stream_selected_cache_invalidate();
         return 0;
@@ -23874,7 +23884,12 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
+    if (g_stream_timing_enabled) {
+        g_stream_timing_ensure_us += cuda_stream_timing_now_us() - t_e0;
+    }
 
+    const double t_p0 = g_stream_timing_enabled ?
+        cuda_stream_timing_now_us() : 0.0;
     const uint32_t configured_cache_budget =
         cuda_stream_expert_cache_configured_budget_class(
             cuda_stream_expert_cache_class_index(table->gate_expert_bytes,
@@ -23884,6 +23899,9 @@ static int cuda_stream_selected_cache_begin_load(
                                          table->down_expert_bytes,
                                          configured_cache_budget) :
         NULL;
+    if (g_stream_timing_enabled) {
+        g_stream_timing_prepare_us += cuda_stream_timing_now_us() - t_p0;
+    }
     int expert_cache_disabled = expert_cache == NULL;
     const uint32_t cache_count_before =
         expert_cache && expert_cache->valid ? expert_cache->count : 0;
@@ -24125,10 +24143,13 @@ static int cuda_stream_selected_cache_begin_load(
         if (g_stream_timing_calls % 61u == 0u) {
             fprintf(stderr,
                     "ds4: stream timing avg over %llu loads: total %.1fus "
-                    "find %.1fus copy %.1fus slots %.1fus (per-token x61: "
-                    "total %.2fms)\n",
+                    "dedup %.1fus ensure %.1fus prepare %.1fus find %.1fus "
+                    "copy %.1fus slots %.1fus (per-token x61: total %.2fms)\n",
                     (unsigned long long)g_stream_timing_calls,
                     g_stream_timing_total_us / (double)g_stream_timing_calls,
+                    g_stream_timing_dedup_us / (double)g_stream_timing_calls,
+                    g_stream_timing_ensure_us / (double)g_stream_timing_calls,
+                    g_stream_timing_prepare_us / (double)g_stream_timing_calls,
                     g_stream_timing_find_us / (double)g_stream_timing_calls,
                     g_stream_timing_copy_us / (double)g_stream_timing_calls,
                     g_stream_timing_slots_us / (double)g_stream_timing_calls,
