@@ -199,6 +199,10 @@ static uint32_t g_stream_expert_runtime_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint32_t g_stream_expert_memory_cap_notices[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint64_t g_stream_expert_class_gate_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint64_t g_stream_expert_class_down_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
+/* Device table: per compact staging slot, the resident-cache slot to gather
+ * from (-1 = direct-loaded). Grow-only, owned by the selected cache. */
+static int32_t *g_stream_gather_slots_ptr;
+static uint64_t g_stream_gather_slots_capacity;
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -220,6 +224,11 @@ static void cuda_stream_selected_cache_release(void) {
     }
     if (g_stream_selected_cache.slot_selected_ptr) {
         (void)cudaFree(g_stream_selected_cache.slot_selected_ptr);
+    }
+    if (g_stream_gather_slots_ptr) {
+        (void)cudaFree(g_stream_gather_slots_ptr);
+        g_stream_gather_slots_ptr = NULL;
+        g_stream_gather_slots_capacity = 0;
     }
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
     g_stream_selected_cache.logical_tier = -1;
@@ -23679,6 +23688,44 @@ static int cuda_stream_layer_expert_ranges_valid(
     return 1;
 }
 
+/* Batched device-to-device gather of resident-cache hits into the compact
+ * staging buffers. One launch replaces the per-expert cudaMemcpy chain
+ * (3 tensors x n experts x 61 layers of ~15us host-driven calls per decoded
+ * token). blockIdx.x = compact slot, blockIdx.y = tensor kind (gate/up/down).
+ * Slots with cache_slots[i] < 0 were direct-loaded into staging already. */
+__global__ static void stream_expert_gather_kernel(
+        char *dst_gate,
+        char *dst_up,
+        char *dst_down,
+        const char *src_gate,
+        const char *src_up,
+        const char *src_down,
+        const int32_t *cache_slots,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    const uint32_t compact = blockIdx.x;
+    const uint32_t kind = blockIdx.y;
+    const int32_t slot = cache_slots[compact];
+    if (slot < 0) return;
+    const uint64_t bytes = kind == 2u ? down_expert_bytes : gate_expert_bytes;
+    const char *src =
+        (kind == 0u ? src_gate : kind == 1u ? src_up : src_down) +
+        (uint64_t)slot * bytes;
+    char *dst =
+        (kind == 0u ? dst_gate : kind == 1u ? dst_up : dst_down) +
+        (uint64_t)compact * bytes;
+    if ((bytes & 15ull) == 0ull &&
+        ((uintptr_t)src & 15ull) == 0ull &&
+        ((uintptr_t)dst & 15ull) == 0ull) {
+        const uint64_t n16 = bytes >> 4;
+        const uint4 *s = (const uint4 *)src;
+        uint4 *d = (uint4 *)dst;
+        for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x) d[i] = s[i];
+    } else {
+        for (uint64_t i = threadIdx.x; i < bytes; i += blockDim.x) dst[i] = src[i];
+    }
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -23798,6 +23845,18 @@ static int cuda_stream_selected_cache_begin_load(
     uint32_t cache_hits = 0;
     uint32_t cache_misses = 0;
     uint32_t direct_loads = 0;
+    const int use_gather =
+        getenv("DS4_CUDA_NO_STREAM_EXPERT_GATHER") == NULL;
+    int any_gather = 0;
+    std::vector<int32_t> gather_slots;
+    if (use_gather && !expert_cache_disabled) {
+        try {
+            gather_slots.assign(compact_ids.size(), -1);
+        } catch (...) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
+    }
 
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
@@ -23860,17 +23919,25 @@ static int cuda_stream_selected_cache_begin_load(
             }
 
             if (cache_slot >= 0) {
-                copied_from_global_cache =
-                    cuda_stream_expert_cache_copy_to_compact(
-                            expert_cache,
-                            (uint32_t)cache_slot,
-                            i,
-                            g_stream_selected_cache.gate_ptr,
-                            g_stream_selected_cache.up_ptr,
-                            g_stream_selected_cache.down_ptr);
-                if (!copied_from_global_cache) {
-                    cuda_stream_expert_cache_invalidate();
-                    expert_cache_disabled = 1;
+                if (use_gather && !gather_slots.empty()) {
+                    /* Defer the cache→staging copy to one batched gather
+                     * launch after the loop. */
+                    gather_slots[i] = cache_slot;
+                    any_gather = 1;
+                    copied_from_global_cache = 1;
+                } else {
+                    copied_from_global_cache =
+                        cuda_stream_expert_cache_copy_to_compact(
+                                expert_cache,
+                                (uint32_t)cache_slot,
+                                i,
+                                g_stream_selected_cache.gate_ptr,
+                                g_stream_selected_cache.up_ptr,
+                                g_stream_selected_cache.down_ptr);
+                    if (!copied_from_global_cache) {
+                        cuda_stream_expert_cache_invalidate();
+                        expert_cache_disabled = 1;
+                    }
                 }
             }
         }
@@ -23901,6 +23968,38 @@ static int cuda_stream_selected_cache_begin_load(
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
+        }
+    }
+
+    if (any_gather && expert_cache) {
+        const uint64_t slots_bytes =
+            (uint64_t)gather_slots.size() * sizeof(int32_t);
+        if (!cuda_stream_selected_ensure_bytes(
+                    (char **)&g_stream_gather_slots_ptr,
+                    &g_stream_gather_slots_capacity,
+                    slots_bytes, "gather slot table") ||
+            !cuda_ok(cudaMemcpy(g_stream_gather_slots_ptr,
+                                gather_slots.data(),
+                                (size_t)slots_bytes,
+                                cudaMemcpyHostToDevice),
+                     "stream gather slot upload")) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
+        dim3 gather_grid((unsigned)gather_slots.size(), 3u);
+        stream_expert_gather_kernel<<<gather_grid, 256>>>(
+                g_stream_selected_cache.gate_ptr,
+                g_stream_selected_cache.up_ptr,
+                g_stream_selected_cache.down_ptr,
+                expert_cache->gate_ptr,
+                expert_cache->up_ptr,
+                expert_cache->down_ptr,
+                g_stream_gather_slots_ptr,
+                table->gate_expert_bytes,
+                table->down_expert_bytes);
+        if (!cuda_ok(cudaGetLastError(), "stream expert gather launch")) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
         }
     }
 
