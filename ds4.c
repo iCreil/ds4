@@ -64626,8 +64626,14 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                      getenv("DS4_NO_FUSED_SESSION_BATCH") == NULL &&
                      count >= 2 && count <= (int)DS4_GPU_DECODE_MULTI_MAX &&
                      first->graph.spec_logits != NULL;
+        /* Streaming decode batches default to the per-session pipelining:
+         * its interleaving overlaps one session's expert-cache miss uploads
+         * with the other sessions' compute, which measures faster than the
+         * lockstep union load (whose sync+load leaves the GPU idle), and it
+         * keeps bit-exact greedy streams. The fused union path stays
+         * available for experiments via DS4_FUSED_STREAM_SESSION_BATCH=1. */
         const bool stream_fused_ok =
-            getenv("DS4_NO_FUSED_STREAM_SESSION_BATCH") == NULL;
+            getenv("DS4_FUSED_STREAM_SESSION_BATCH") != NULL;
         for (int i = 0; fused && i < count; i++) {
             ds4_session *s = items[i].session;
             if (s->graph.raw_cap == 0 || s->distributed ||
