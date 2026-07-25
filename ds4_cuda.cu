@@ -199,6 +199,13 @@ static uint32_t g_stream_expert_runtime_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint32_t g_stream_expert_memory_cap_notices[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint64_t g_stream_expert_class_gate_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint64_t g_stream_expert_class_down_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
+/* Requested cap the current cache allocation of each class settled at.
+ * When the VRAM-capped capacity ends up below the requested budget, the
+ * cheap "capacity >= target" fast path in prepare() can never hit, and
+ * every per-layer load would fall through to cudaMemGetInfo (~1ms per
+ * call, i.e. ~55ms of the ~60ms decode step at 61 layers). Remembering
+ * the settled request lets steady-state loads return immediately. */
+static uint32_t g_stream_expert_settled_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
 /* Device table: per compact staging slot, the resident-cache slot to gather
  * from (-1 = direct-loaded). Grow-only, owned by the selected cache. */
 static int32_t *g_stream_gather_slots_ptr;
@@ -23031,6 +23038,7 @@ static void cuda_stream_expert_cache_release_class(int class_idx) {
         (void)cudaFree(cache->down_ptr);
     }
     std::vector<cuda_stream_expert_cache_slot>().swap(cache->slots);
+    g_stream_expert_settled_caps[class_idx] = 0;
     cache->valid = 0;
     cache->capacity = 0;
     cache->count = 0;
@@ -23367,6 +23375,7 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
     if (requested_cap == 0) return NULL;
     if (target_cap == 0 || target_cap > requested_cap) target_cap = requested_cap;
     if (target_cap == 0) return NULL;
+    const uint32_t entry_target = target_cap;
     const int same_dims =
         cache->valid &&
         cache->gate_expert_bytes == gate_expert_bytes &&
@@ -23376,8 +23385,9 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
     }
     if (same_dims &&
         cache->capacity != 0 &&
-        cache->capacity >= target_cap &&
-        cache->slots.size() == cache->capacity) {
+        cache->slots.size() == cache->capacity &&
+        (cache->capacity >= target_cap ||
+         g_stream_expert_settled_caps[class_idx] == entry_target)) {
         return cache;
     }
 
@@ -23399,6 +23409,7 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         cache->capacity != 0 &&
         cache->capacity >= cap &&
         cache->slots.size() == cache->capacity) {
+        g_stream_expert_settled_caps[class_idx] = entry_target;
         return cache;
     }
 
@@ -23466,6 +23477,7 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             (uint64_t)cap * gate_expert_bytes;
         cache->down_capacity =
             (uint64_t)cap * down_expert_bytes;
+        g_stream_expert_settled_caps[class_idx] = entry_target;
         return cache;
     }
     return NULL;
