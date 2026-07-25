@@ -23693,6 +23693,8 @@ static int cuda_stream_layer_expert_ranges_valid(
  * (3 tensors x n experts x 61 layers of ~15us host-driven calls per decoded
  * token). blockIdx.x = compact slot, blockIdx.y = tensor kind (gate/up/down).
  * Slots with cache_slots[i] < 0 were direct-loaded into staging already. */
+#define DS4_CUDA_STREAM_GATHER_CHUNK (128ull * 1024ull)
+
 __global__ static void stream_expert_gather_kernel(
         char *dst_gate,
         char *dst_up,
@@ -23708,21 +23710,29 @@ __global__ static void stream_expert_gather_kernel(
     const int32_t slot = cache_slots[compact];
     if (slot < 0) return;
     const uint64_t bytes = kind == 2u ? down_expert_bytes : gate_expert_bytes;
+    const uint64_t chunk_off =
+        (uint64_t)blockIdx.z * DS4_CUDA_STREAM_GATHER_CHUNK;
+    if (chunk_off >= bytes) return;
+    const uint64_t chunk_bytes =
+        bytes - chunk_off < DS4_CUDA_STREAM_GATHER_CHUNK ?
+            bytes - chunk_off : DS4_CUDA_STREAM_GATHER_CHUNK;
     const char *src =
         (kind == 0u ? src_gate : kind == 1u ? src_up : src_down) +
-        (uint64_t)slot * bytes;
+        (uint64_t)slot * bytes + chunk_off;
     char *dst =
         (kind == 0u ? dst_gate : kind == 1u ? dst_up : dst_down) +
-        (uint64_t)compact * bytes;
-    if ((bytes & 15ull) == 0ull &&
+        (uint64_t)compact * bytes + chunk_off;
+    if ((chunk_bytes & 15ull) == 0ull &&
         ((uintptr_t)src & 15ull) == 0ull &&
         ((uintptr_t)dst & 15ull) == 0ull) {
-        const uint64_t n16 = bytes >> 4;
+        const uint64_t n16 = chunk_bytes >> 4;
         const uint4 *s = (const uint4 *)src;
         uint4 *d = (uint4 *)dst;
         for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x) d[i] = s[i];
     } else {
-        for (uint64_t i = threadIdx.x; i < bytes; i += blockDim.x) dst[i] = src[i];
+        for (uint64_t i = threadIdx.x; i < chunk_bytes; i += blockDim.x) {
+            dst[i] = src[i];
+        }
     }
 }
 
@@ -23986,7 +23996,14 @@ static int cuda_stream_selected_cache_begin_load(
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
-        dim3 gather_grid((unsigned)gather_slots.size(), 3u);
+        const uint64_t max_bytes =
+            table->gate_expert_bytes > table->down_expert_bytes ?
+                table->gate_expert_bytes : table->down_expert_bytes;
+        const uint64_t chunks =
+            (max_bytes + DS4_CUDA_STREAM_GATHER_CHUNK - 1ull) /
+            DS4_CUDA_STREAM_GATHER_CHUNK;
+        dim3 gather_grid((unsigned)gather_slots.size(), 3u,
+                         (unsigned)(chunks == 0 ? 1 : chunks));
         stream_expert_gather_kernel<<<gather_grid, 256>>>(
                 g_stream_selected_cache.gate_ptr,
                 g_stream_selected_cache.up_ptr,
