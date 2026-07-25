@@ -20880,6 +20880,77 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
+/* Fused multi-session decode over SSD streaming: one readback of all
+ * n_seqs x DS4_N_EXPERT_USED router selections and one staged load of
+ * their union per layer, instead of one sync + load round trip per
+ * session.  Unlike the prefill batch load this uses the eviction-enabled
+ * selected load (decode owns the LRU working set), and a failure is a
+ * hard error: the per-sequence MoE launches that follow can only read
+ * staged experts. */
+static bool metal_graph_cuda_stream_fused_decode_selected_load(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint32_t                  n_seqs,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
+        !model ||
+        !metal_graph_batch_router_selected(g) ||
+        n_seqs == 0 ||
+        DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT_USED == 0) {
+        fprintf(stderr,
+                "ds4: CUDA streaming fused decode selected load unsupported at layer %u\n",
+                il);
+        return false;
+    }
+    const uint64_t n_ids64 = (uint64_t)n_seqs * DS4_N_EXPERT_USED;
+    if (n_ids64 == 0 || n_ids64 > SIZE_MAX / sizeof(int32_t) ||
+        n_ids64 > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA streaming fused decode selected-id count overflow at layer %u\n",
+                il);
+        return false;
+    }
+
+    if (ds4_gpu_end_commands() == 0) return false;
+
+    int32_t *selected_ids = xmalloc((size_t)n_ids64 * sizeof(selected_ids[0]));
+    bool ok = ds4_gpu_tensor_read(metal_graph_batch_router_selected(g),
+                                  0,
+                                  selected_ids,
+                                  n_ids64 * sizeof(selected_ids[0])) != 0;
+    if (ok) {
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &table,
+                    selected_ids,
+                    (uint32_t)n_ids64) != 0;
+    }
+    free(selected_ids);
+
+    if (ds4_gpu_begin_commands() == 0) ok = false;
+    return ok;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)n_seqs;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    return false;
+#endif
+}
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -28885,14 +28956,28 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     g->tp_batch_in[il],
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
-    } else if (ok && metal_graph_fused_decode_moe_per_seq && !g->ssd_streaming) {
+    } else if (ok && metal_graph_fused_decode_moe_per_seq) {
         /* Fused session-batch decode: routed experts one row (= one sequence)
          * at a time through the single-token decode MoE kernel.  At 2-4 rows
          * the selected experts are almost always distinct, so there is
          * nothing to share and the batch expert path costs far more than
-         * n_tokens single-token passes. */
+         * n_tokens single-token passes.
+         * Over SSD streaming the union of all rows' selected experts is
+         * staged once (one sync + one load per layer); each row's MoE
+         * launch then reads its own window of the union slot remap. */
+        if (g->ssd_streaming) {
+            ok = metal_graph_cuda_stream_fused_decode_selected_load(
+                    g, model, layer, il, n_tokens,
+                    gate_expert_bytes, down_expert_bytes);
+        }
         const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
         for (uint32_t r = 0; ok && r < n_tokens; r++) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+            if (g->ssd_streaming) {
+                ds4_gpu_stream_selected_set_row_offset(
+                        r * (uint32_t)DS4_N_EXPERT_USED);
+            }
+#endif
             ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
                     metal_graph_batch_routed_out(g), (uint64_t)r * vec_bytes, vec_bytes);
             ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
@@ -28937,6 +29022,9 @@ static bool metal_graph_encode_layer_ffn_batch(
             ds4_gpu_tensor_free(x_row);
             ds4_gpu_tensor_free(out_row);
         }
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        if (g->ssd_streaming) ds4_gpu_stream_selected_set_row_offset(0);
+#endif
         g->batch_routed_mid_is_f16 = false;
     } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
@@ -29903,8 +29991,23 @@ static bool metal_graph_encode_decode_multi(
     if (n_seqs == 0 || n_seqs > DS4_GPU_DECODE_MULTI_MAX) return false;
     if (metal_graph_directional_steering_attn_enabled(g)) return false;
     if (need_logits && !g->spec_logits) return false;
+    bool any_streaming = false;
     for (uint32_t b = 0; b < n_seqs; b++) {
-        if (graphs[b]->raw_cap == 0 || graphs[b]->ssd_streaming) return false;
+        if (graphs[b]->raw_cap == 0) return false;
+        if (graphs[b]->ssd_streaming) any_streaming = true;
+    }
+    if (any_streaming) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        /* Streaming sessions co-decode via the per-layer union selected
+         * load (CUDA only); mixed resident/streaming batches would share
+         * one staging table with different expectations, so require a
+         * uniform batch. */
+        for (uint32_t b = 0; b < n_seqs; b++) {
+            if (!graphs[b]->ssd_streaming) return false;
+        }
+#else
+        return false;
+#endif
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -64523,10 +64626,12 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
                      getenv("DS4_NO_FUSED_SESSION_BATCH") == NULL &&
                      count >= 2 && count <= (int)DS4_GPU_DECODE_MULTI_MAX &&
                      first->graph.spec_logits != NULL;
+        const bool stream_fused_ok =
+            getenv("DS4_NO_FUSED_STREAM_SESSION_BATCH") == NULL;
         for (int i = 0; fused && i < count; i++) {
             ds4_session *s = items[i].session;
-            if (s->graph.ssd_streaming || s->graph.raw_cap == 0 ||
-                s->distributed) {
+            if (s->graph.raw_cap == 0 || s->distributed ||
+                (s->graph.ssd_streaming && !stream_fused_ok)) {
                 fused = false;
             }
         }

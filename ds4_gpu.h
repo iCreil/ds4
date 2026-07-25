@@ -174,6 +174,12 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+/* Fused multi-session decode over SSD streaming (CUDA): the union of the
+ * sessions' selected experts is staged once per layer; each per-session
+ * MoE launch reads its own row window of the slot remap. */
+void ds4_gpu_stream_selected_set_row_offset(uint32_t row);
+#endif
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,

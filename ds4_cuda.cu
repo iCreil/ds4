@@ -208,6 +208,9 @@ static uint64_t g_stream_expert_class_down_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES]
  * immediately. Cleared on release and re-evaluated when the requested
  * budget changes. */
 static uint32_t g_stream_expert_settled_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
+/* Row window into the union slot remap consumed by the next MoE launch
+ * (fused multi-session decode); 0 = whole table from the first row. */
+static uint32_t g_stream_selected_row_offset;
 
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
@@ -21341,6 +21344,10 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int logical_tier = ds4_tensor_device_idx(out);
+    /* Union loads for fused multi-session decode stage N sessions' experts
+     * in one compact table; each per-session MoE launch then reads its own
+     * row window of the slot remap (offset set by the graph driver). */
+    const uint64_t selected_row_offset = (uint64_t)g_stream_selected_row_offset;
     const int use_stream_selected_cache =
         allow_streaming &&
         g_ssd_streaming_mode &&
@@ -21349,7 +21356,8 @@ static int routed_moe_launch(
         g_stream_selected_cache.model_map == model_map &&
         g_stream_selected_cache.layer == layer_index &&
         g_stream_selected_cache.n_total_expert == n_total_expert &&
-        g_stream_selected_cache.slot_count >= required_slot_count &&
+        g_stream_selected_cache.slot_count >=
+            selected_row_offset + required_slot_count &&
         g_stream_selected_cache.gate_offset == gate_offset &&
         g_stream_selected_cache.up_offset == up_offset &&
         g_stream_selected_cache.down_offset == down_offset &&
@@ -21360,7 +21368,7 @@ static int routed_moe_launch(
         g_stream_selected_cache.down_ptr &&
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
-            required_slot_count * sizeof(int32_t);
+            (selected_row_offset + required_slot_count) * sizeof(int32_t);
     if (g_ssd_streaming_mode && allow_streaming &&
         !use_stream_selected_cache) {
         fprintf(stderr,
@@ -21368,8 +21376,13 @@ static int routed_moe_launch(
                 layer_index);
         return 0;
     }
+    ds4_gpu_tensor selected_view;
     if (use_stream_selected_cache) {
-        selected = &g_stream_selected_cache.slot_selected_tensor;
+        selected_view = g_stream_selected_cache.slot_selected_tensor;
+        const uint64_t off_bytes = selected_row_offset * sizeof(int32_t);
+        selected_view.ptr = (char *)selected_view.ptr + off_bytes;
+        selected_view.bytes -= off_bytes;
+        selected = &selected_view;
     }
     const char *gate_w = use_stream_selected_cache ?
         g_stream_selected_cache.gate_ptr :
@@ -28705,6 +28718,10 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
+}
+
+extern "C" void ds4_gpu_stream_selected_set_row_offset(uint32_t row) {
+    g_stream_selected_row_offset = row;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
