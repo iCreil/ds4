@@ -20264,6 +20264,17 @@ static bool metal_graph_use_cuda_selected_shared_overlap(const ds4_gpu_graph *g)
 #endif
 }
 
+/* CUDA event-based selected readback: kernels launch eagerly on the legacy
+ * stream, so the overlap block needs no commit/flush from the main thread —
+ * those calls map to cudaDeviceSynchronize and drain the device per layer. */
+static bool metal_graph_cuda_selected_event_readback(void) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    return getenv("DS4_CUDA_DISABLE_SELECTED_EVENT_READBACK") == NULL;
+#else
+    return false;
+#endif
+}
+
 static bool metal_graph_q4_non_streaming_opt_in_enabled(void) {
     return getenv("DS4_METAL_ENABLE_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
            getenv("DS4_METAL_ENABLE_PRO_Q4_SELECTED_EXPERT_VIEWS") != NULL ||
@@ -20302,6 +20313,7 @@ static bool metal_graph_use_iq2_selected_async_early_commit(
     return g &&
            g->ssd_streaming &&
 #ifndef DS4_ROCM_BUILD
+           !metal_graph_cuda_selected_event_readback() &&
            getenv("DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_EARLY_COMMIT") == NULL;
 #else
            false;
@@ -21287,7 +21299,9 @@ static void metal_graph_selected_async_load_run(
         return;
     }
     if (job->event_value != 0) {
-#ifdef DS4_ROCM_BUILD
+/* ROCm and CUDA read the ids on a dedicated stream fenced by the router
+ * event, so the worker never waits on work the main thread keeps queueing. */
+#if defined(DS4_ROCM_BUILD) || (!defined(__APPLE__) && !defined(DS4_NO_GPU))
         if (ds4_gpu_tensor_read_after_selected_event(
                     job->router_selected,
                     0,
@@ -23931,7 +23945,8 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
         if (async_load_started) {
-            const bool flush_ok = ds4_gpu_flush_commands() != 0;
+            const bool flush_ok = metal_graph_cuda_selected_event_readback() ||
+                                  ds4_gpu_flush_commands() != 0;
             bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
             if (!finish_ok && async_load.ids_ok) {
