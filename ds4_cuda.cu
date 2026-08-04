@@ -148,6 +148,15 @@ typedef struct {
     int32_t *slot_selected_ptr;
     uint64_t slot_selected_capacity;
     ds4_gpu_tensor slot_selected_tensor;
+    /* Zero-copy mode: the selected table aliases the resident expert cache
+     * pools instead of holding per-layer copies, and the uploaded ids are
+     * cache-slot indices. The pointers are borrowed from the expert cache
+     * and must never be freed here. */
+    int use_borrowed;
+    char *borrowed_gate_ptr;
+    char *borrowed_up_ptr;
+    char *borrowed_down_ptr;
+    uint32_t borrowed_capacity;
 } cuda_stream_selected_cache;
 
 static cuda_stream_selected_cache g_stream_selected_cache;
@@ -24268,9 +24277,14 @@ static int routed_moe_launch(
             g_stream_selected_cache.down_offset == down_offset &&
             g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
             g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-            g_stream_selected_cache.gate_ptr &&
-            g_stream_selected_cache.up_ptr &&
-            g_stream_selected_cache.down_ptr &&
+            (g_stream_selected_cache.use_borrowed ?
+                 (g_stream_selected_cache.borrowed_gate_ptr &&
+                  g_stream_selected_cache.borrowed_up_ptr &&
+                  g_stream_selected_cache.borrowed_down_ptr &&
+                  g_stream_selected_cache.borrowed_capacity != 0u) :
+                 (g_stream_selected_cache.gate_ptr &&
+                  g_stream_selected_cache.up_ptr &&
+                  g_stream_selected_cache.down_ptr)) &&
             g_stream_selected_cache.slot_selected_tensor.ptr &&
             g_stream_selected_cache.slot_selected_tensor.bytes >=
                 slot_count * sizeof(int32_t);
@@ -24282,20 +24296,27 @@ static int routed_moe_launch(
             return 0;
         }
 
+        const int selected_borrowed = use_stream_selected_cache &&
+            g_stream_selected_cache.use_borrowed;
         const ds4_gpu_tensor *mx_selected = use_stream_selected_cache ?
             &g_stream_selected_cache.slot_selected_tensor : selected;
         const uint32_t weight_experts = use_stream_selected_cache ?
-            g_stream_selected_cache.compact_count : n_total_expert;
+            (selected_borrowed ? g_stream_selected_cache.borrowed_capacity :
+                                 g_stream_selected_cache.compact_count) :
+            n_total_expert;
         const char *gate_w = use_stream_selected_cache ?
-            g_stream_selected_cache.gate_ptr :
+            (selected_borrowed ? g_stream_selected_cache.borrowed_gate_ptr :
+                                 g_stream_selected_cache.gate_ptr) :
             cuda_resolve_weight_ptr(model_map, gate_offset, gate_total,
                                     logical_tier, "mxfp4 moe gate");
         const char *up_w = use_stream_selected_cache ?
-            g_stream_selected_cache.up_ptr :
+            (selected_borrowed ? g_stream_selected_cache.borrowed_up_ptr :
+                                 g_stream_selected_cache.up_ptr) :
             cuda_resolve_weight_ptr(model_map, up_offset, gate_total,
                                     logical_tier, "mxfp4 moe up");
         const char *down_w = use_stream_selected_cache ?
-            g_stream_selected_cache.down_ptr :
+            (selected_borrowed ? g_stream_selected_cache.borrowed_down_ptr :
+                                 g_stream_selected_cache.down_ptr) :
             cuda_resolve_weight_ptr(model_map, down_offset, down_total,
                                     logical_tier, "mxfp4 moe down");
         if (!gate_w || !up_w || !down_w || weight_experts == 0u) return 0;
@@ -24462,9 +24483,14 @@ static int routed_moe_launch(
         g_stream_selected_cache.down_offset == down_offset &&
         g_stream_selected_cache.gate_expert_bytes == gate_expert_bytes &&
         g_stream_selected_cache.down_expert_bytes == down_expert_bytes &&
-        g_stream_selected_cache.gate_ptr &&
-        g_stream_selected_cache.up_ptr &&
-        g_stream_selected_cache.down_ptr &&
+        (g_stream_selected_cache.use_borrowed ?
+             (g_stream_selected_cache.borrowed_gate_ptr &&
+              g_stream_selected_cache.borrowed_up_ptr &&
+              g_stream_selected_cache.borrowed_down_ptr &&
+              g_stream_selected_cache.borrowed_capacity != 0u) :
+             (g_stream_selected_cache.gate_ptr &&
+              g_stream_selected_cache.up_ptr &&
+              g_stream_selected_cache.down_ptr)) &&
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
@@ -24475,19 +24501,24 @@ static int routed_moe_launch(
                 layer_index);
         return 0;
     }
+    const int selected_borrowed = use_stream_selected_cache &&
+        g_stream_selected_cache.use_borrowed;
     if (use_stream_selected_cache) {
         selected = &g_stream_selected_cache.slot_selected_tensor;
     }
     const char *gate_w = use_stream_selected_cache ?
-        g_stream_selected_cache.gate_ptr :
+        (selected_borrowed ? g_stream_selected_cache.borrowed_gate_ptr :
+                             g_stream_selected_cache.gate_ptr) :
         cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
                                 logical_tier, "moe_gate");
     const char *up_w = use_stream_selected_cache ?
-        g_stream_selected_cache.up_ptr :
+        (selected_borrowed ? g_stream_selected_cache.borrowed_up_ptr :
+                             g_stream_selected_cache.up_ptr) :
         cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
                                 logical_tier, "moe_up");
     const char *down_w = use_stream_selected_cache ?
-        g_stream_selected_cache.down_ptr :
+        (selected_borrowed ? g_stream_selected_cache.borrowed_down_ptr :
+                             g_stream_selected_cache.down_ptr) :
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
@@ -26641,6 +26672,16 @@ static int cuda_stream_selected_ranges_valid(
 
 static void cuda_stream_expert_cache_release_class(int class_idx) {
     cuda_stream_expert_cache *cache = &g_stream_expert_caches[class_idx];
+    /* A zero-copy selected table may alias this cache's pools: invalidate
+     * it before the pools are freed so no consumer reads dangling memory. */
+    if (g_stream_selected_cache.use_borrowed) {
+        g_stream_selected_cache.valid = 0;
+        g_stream_selected_cache.use_borrowed = 0;
+        g_stream_selected_cache.borrowed_gate_ptr = NULL;
+        g_stream_selected_cache.borrowed_up_ptr = NULL;
+        g_stream_selected_cache.borrowed_down_ptr = NULL;
+        g_stream_selected_cache.borrowed_capacity = 0;
+    }
     if (cache->gate_ptr) {
         (void)cudaFree(cache->gate_ptr);
     }
@@ -27379,6 +27420,33 @@ static int cuda_stream_selected_slot_table_upload(void *dst,
     return 1;
 }
 
+static int cuda_stream_selected_zerocopy_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_CUDA_DISABLE_SELECTED_ZEROCOPY") == NULL;
+    }
+    return cached;
+}
+
+/* Reloading an evicted (previously valid) cache slot in zero-copy mode may
+ * overwrite memory a still-running kernel of the previous layer reads
+ * through its aliased table. Make the upload stream wait on the legacy
+ * stream's progress once per begin_load before the first such reload; the
+ * fence is async, the host never blocks here. */
+static int cuda_stream_selected_zerocopy_evict_fence(void) {
+    static cudaEvent_t ev;
+    if (!g_stream_selected_upload_stream) return 1;
+    if (!ev &&
+        !cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
+                 "zero-copy evict fence create")) {
+        ev = NULL;
+        return 0;
+    }
+    return cuda_ok(cudaEventRecord(ev, 0), "zero-copy evict fence record") &&
+           cuda_ok(cudaStreamWaitEvent(g_stream_selected_upload_stream, ev, 0),
+                   "zero-copy evict fence wait");
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27443,6 +27511,145 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
+
+    const uint32_t configured_cache_budget =
+        cuda_stream_expert_cache_configured_budget_class(
+            cuda_stream_expert_cache_class_index(table->gate_expert_bytes,
+                                                 table->down_expert_bytes));
+    cuda_stream_expert_cache *expert_cache = configured_cache_budget != 0 ?
+        cuda_stream_expert_cache_prepare(table->gate_expert_bytes,
+                                         table->down_expert_bytes,
+                                         configured_cache_budget) :
+        NULL;
+    int expert_cache_disabled = expert_cache == NULL;
+    const uint32_t cache_count_before =
+        expert_cache && expert_cache->valid ? expert_cache->count : 0;
+    uint32_t cache_hits = 0;
+    uint32_t cache_misses = 0;
+    uint32_t direct_loads = 0;
+
+    /* Zero-copy fast path: resolve every selected expert to a resident
+     * cache slot (loading misses into LRU slots), upload cache-slot ids and
+     * alias the table to the cache pools. Hits then cost no copies at all,
+     * where the compact path pays one D2D (or H2D) copy per expert per
+     * layer per token. Falls back to the compact path when any expert
+     * cannot live in the cache (e.g. no-evict prefill with a full cache). */
+    if (!expert_cache_disabled && expert_cache->valid &&
+        cuda_stream_selected_zerocopy_enabled()) {
+        int zero_copy = 1;
+        int evict_fenced = 0;
+        for (uint32_t i = 0; i < compact_ids.size(); i++) {
+            const uint32_t expert = (uint32_t)compact_ids[i];
+            int cache_slot =
+                cuda_stream_expert_cache_find(expert_cache,
+                                              table->model_map,
+                                              table->model_size,
+                                              table->layer,
+                                              table->n_total_expert,
+                                              expert,
+                                              table->gate_offset,
+                                              table->up_offset,
+                                              table->down_offset,
+                                              table->gate_expert_bytes,
+                                              table->down_expert_bytes);
+            if (cache_slot >= 0) {
+                cache_hits++;
+                expert_cache->slots[(uint32_t)cache_slot].age =
+                    ++expert_cache->tick;
+            } else if (allow_cache_evict ||
+                       expert_cache->count < expert_cache->capacity) {
+                cache_misses++;
+                const uint32_t load_slot =
+                    cuda_stream_expert_cache_lru_slot(expert_cache);
+                const int append = !expert_cache->slots[load_slot].valid;
+                if (!append && !evict_fenced) {
+                    if (!cuda_stream_selected_zerocopy_evict_fence()) {
+                        zero_copy = 0;
+                        break;
+                    }
+                    evict_fenced = 1;
+                }
+                if (cuda_stream_expert_cache_load_slot(
+                            expert_cache,
+                            table->model_map,
+                            table->model_size,
+                            load_slot,
+                            table->layer,
+                            table->n_total_expert,
+                            expert,
+                            table->gate_offset,
+                            table->up_offset,
+                            table->down_offset,
+                            table->gate_expert_bytes,
+                            table->down_expert_bytes)) {
+                    if (append &&
+                        expert_cache->count < expert_cache->capacity) {
+                        expert_cache->count++;
+                    }
+                    cache_slot = (int)load_slot;
+                } else {
+                    zero_copy = 0;
+                    break;
+                }
+            } else {
+                zero_copy = 0;
+                break;
+            }
+            expert_to_slot[expert] = cache_slot;
+        }
+        if (zero_copy) {
+            for (uint32_t i = 0; i < slot_count; i++) {
+                slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
+            }
+            if (!cuda_stream_selected_ensure_i32(slot_count) ||
+                !cuda_stream_selected_slot_table_upload(
+                        g_stream_selected_cache.slot_selected_ptr,
+                        slot_ids.data(),
+                        (uint64_t)slot_count * sizeof(int32_t))) {
+                cuda_stream_selected_cache_invalidate();
+                return 0;
+            }
+            if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
+                cuda_model_load_progress_finish();
+                fprintf(stderr,
+                        "ds4: CUDA streaming selected layer=%u slots=%u compact=%u "
+                        "zerocopy=1 global_budget=%u before=%u after=%u hits=%u misses=%u\n",
+                        table->layer,
+                        slot_count,
+                        (uint32_t)compact_ids.size(),
+                        expert_cache->capacity,
+                        cache_count_before,
+                        expert_cache->count,
+                        cache_hits,
+                        cache_misses);
+            }
+            g_stream_selected_cache.logical_tier = logical_tier;
+            g_stream_selected_cache.model_map = table->model_map;
+            g_stream_selected_cache.layer = table->layer;
+            g_stream_selected_cache.n_total_expert = table->n_total_expert;
+            g_stream_selected_cache.slot_count = slot_count;
+            g_stream_selected_cache.compact_count = (uint32_t)compact_count;
+            g_stream_selected_cache.gate_offset = table->gate_offset;
+            g_stream_selected_cache.up_offset = table->up_offset;
+            g_stream_selected_cache.down_offset = table->down_offset;
+            g_stream_selected_cache.gate_expert_bytes = table->gate_expert_bytes;
+            g_stream_selected_cache.down_expert_bytes = table->down_expert_bytes;
+            g_stream_selected_cache.slot_selected_tensor.ptr =
+                g_stream_selected_cache.slot_selected_ptr;
+            g_stream_selected_cache.slot_selected_tensor.bytes =
+                (uint64_t)slot_count * sizeof(int32_t);
+            g_stream_selected_cache.slot_selected_tensor.owner = 0;
+            g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
+            g_stream_selected_cache.use_borrowed = 1;
+            g_stream_selected_cache.borrowed_gate_ptr = expert_cache->gate_ptr;
+            g_stream_selected_cache.borrowed_up_ptr = expert_cache->up_ptr;
+            g_stream_selected_cache.borrowed_down_ptr = expert_cache->down_ptr;
+            g_stream_selected_cache.borrowed_capacity = expert_cache->capacity;
+            g_stream_selected_cache.valid = 1;
+            return 1;
+        }
+    }
+
     /* Try to allocate the staging buffers with the resident expert cache
      * still in place: an unconditional release here would throw away the
      * warm decode working set on every request. Only when VRAM is really
@@ -27463,6 +27670,8 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_ensure_i32(slot_count);
     if (!selected_ok) {
         cuda_stream_expert_cache_release_all();
+        expert_cache = NULL;
+        expert_cache_disabled = 1;
         selected_ok =
             cuda_stream_selected_ensure_bytes(
                     &g_stream_selected_cache.gate_ptr,
@@ -27482,22 +27691,6 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
-
-    const uint32_t configured_cache_budget =
-        cuda_stream_expert_cache_configured_budget_class(
-            cuda_stream_expert_cache_class_index(table->gate_expert_bytes,
-                                                 table->down_expert_bytes));
-    cuda_stream_expert_cache *expert_cache = configured_cache_budget != 0 ?
-        cuda_stream_expert_cache_prepare(table->gate_expert_bytes,
-                                         table->down_expert_bytes,
-                                         configured_cache_budget) :
-        NULL;
-    int expert_cache_disabled = expert_cache == NULL;
-    const uint32_t cache_count_before =
-        expert_cache && expert_cache->valid ? expert_cache->count : 0;
-    uint32_t cache_hits = 0;
-    uint32_t cache_misses = 0;
-    uint32_t direct_loads = 0;
 
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
@@ -27644,6 +27837,7 @@ static int cuda_stream_selected_cache_begin_load(
         (uint64_t)slot_count * sizeof(int32_t);
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.slot_selected_tensor.device_id = logical_tier;
+    g_stream_selected_cache.use_borrowed = 0;
     g_stream_selected_cache.valid = 1;
     return 1;
 }
